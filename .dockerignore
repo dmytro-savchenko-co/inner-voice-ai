@@ -1,0 +1,9 @@
+node_modules
+.next
+.git
+social-media
+ec2/node_modules
+ec2/users.db
+prisma/dev.db
+.env
+.env.local

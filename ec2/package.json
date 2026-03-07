@@ -1,0 +1,23 @@
+{
+  "name": "inner-voice-ec2",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "proxy": "npx tsx proxy.ts",
+    "provision": "npx tsx provision-api.ts",
+    "pairing-mcp": "npx tsx pairing-mcp.ts",
+    "start": "npx tsx proxy.ts & npx tsx provision-api.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "better-sqlite3": "^11.0.0",
+    "canvas": "^2.11.2",
+    "replicate": "^1.0.1",
+    "tsx": "^4.19.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^20.0.0"
+  }
+}

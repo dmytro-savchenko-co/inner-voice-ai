@@ -1,0 +1,40 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  createdAt    DateTime @default(now())
+
+  betternessConnection BetternessConnection?
+  telegramPairing      TelegramPairing?
+}
+
+model BetternessConnection {
+  id             String   @id @default(cuid())
+  userId         String   @unique
+  encryptedToken String
+  connectedAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model TelegramPairing {
+  id               String   @id @default(cuid())
+  userId           String   @unique
+  telegramUsername  String?
+  telegramUserId   String?
+  pairingCode      String   @unique
+  approved         Boolean  @default(false)
+  createdAt        DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
