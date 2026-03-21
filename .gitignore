@@ -58,3 +58,4 @@ ec2/users.db
 *.db
 *.db-journal
 seed.db
+output/
