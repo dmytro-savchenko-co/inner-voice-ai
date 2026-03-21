@@ -3,7 +3,8 @@ WORKDIR /app
 ENV NODE_ENV=production
 
 COPY ec2/package.json ec2/package-lock.json ./
-RUN npm ci --omit=dev
+# Skip canvas native module build (not needed for scheduler)
+RUN npm ci --omit=dev --ignore-scripts
 
 COPY ec2/scheduler.ts ./
 
