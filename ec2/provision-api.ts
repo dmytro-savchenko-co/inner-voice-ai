@@ -1,26 +1,90 @@
 import http from "node:http";
 import fs from "node:fs";
-import Database from "better-sqlite3";
 import path from "node:path";
-import { generateFutureSelf } from "./image-gen.js";
+import { spawn } from "node:child_process";
+import crypto from "node:crypto";
+import pg from "pg";
 
 const PORT = 3002;
 const API_KEY = process.env.EC2_API_KEY || "change-me-to-a-shared-secret";
 const WEBSITE_URL = process.env.WEBSITE_URL || "https://elegant-stillness-production.up.railway.app";
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const BETTERNESS_MCP_URL = "https://api.betterness.ai/mcp";
-const DB_PATH = path.join(__dirname, "users.db");
+const DATABASE_URL = process.env.DATABASE_URL || "";
 const PHOTOS_DIR = "/tmp/inner-voice-photos";
+const PROJECT_ROOT = __dirname;
+const PYTHON_BIN = path.join(PROJECT_ROOT, ".venv", "bin", "python3");
 
-const db = new Database(DB_PATH);
-db.exec(`
-  CREATE TABLE IF NOT EXISTS user_tokens (
-    telegram_user_id TEXT PRIMARY KEY,
-    betterness_token TEXT NOT NULL,
-    telegram_username TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-  )
-`);
+// PostgreSQL connection pool
+const pool = new pg.Pool({
+  connectionString: DATABASE_URL,
+  max: 10,
+  idleTimeoutMillis: 30000,
+});
+
+// Ensure tables exist (idempotent — matches Prisma schema)
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS "UserPreferences" (
+      id TEXT PRIMARY KEY,
+      "userId" TEXT NOT NULL UNIQUE,
+      "telegramUserId" TEXT NOT NULL UNIQUE,
+      timezone TEXT DEFAULT 'America/New_York',
+      "morningCheckinTime" TEXT DEFAULT '08:00',
+      "eveningCheckinTime" TEXT DEFAULT '21:00',
+      "checkinIntensity" TEXT DEFAULT 'normal',
+      "dndStart" TEXT,
+      "dndEnd" TEXT,
+      "onboardingComplete" BOOLEAN DEFAULT false,
+      "activeHabit" TEXT,
+      "habitStartDate" TEXT,
+      "lastVideoRefresh" TEXT,
+      "baselineWeekEnd" TEXT,
+      "lastMorningSent" TEXT,
+      "lastEveningSent" TEXT,
+      "lastWeeklySent" TEXT,
+      "lastUserMessage" TIMESTAMPTZ,
+      "lastTemplateIdx" INTEGER DEFAULT 0,
+      "createdAt" TIMESTAMPTZ DEFAULT now(),
+      "updatedAt" TIMESTAMPTZ DEFAULT now()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS "DailyLog" (
+      id SERIAL PRIMARY KEY,
+      "userId" TEXT NOT NULL,
+      "telegramUserId" TEXT NOT NULL,
+      date TEXT NOT NULL,
+      "checkinType" TEXT DEFAULT 'morning',
+      wellbeing INTEGER,
+      "moodLabel" TEXT,
+      "bodyStatus" TEXT DEFAULT 'fine',
+      "painLocation" TEXT,
+      "painSeverity" INTEGER,
+      "sleepSelfReport" TEXT,
+      "expectedDayLoad" TEXT,
+      "didActiveHabit" BOOLEAN,
+      "habitNotes" TEXT,
+      notes TEXT,
+      "checkinTime" TIMESTAMPTZ DEFAULT now(),
+      UNIQUE("telegramUserId", date, "checkinType")
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS "GenerationJob" (
+      id TEXT PRIMARY KEY,
+      "userId" TEXT NOT NULL,
+      "telegramUserId" TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      "videoPath" TEXT,
+      error TEXT,
+      "createdAt" TIMESTAMPTZ DEFAULT now(),
+      "completedAt" TIMESTAMPTZ
+    )
+  `);
+  console.log("Database tables initialized");
+}
 
 function authenticate(req: http.IncomingMessage): boolean {
   return req.headers["x-api-key"] === API_KEY;
@@ -32,6 +96,50 @@ async function readBody(req: http.IncomingMessage): Promise<string> {
     req.on("data", (chunk) => (data += chunk));
     req.on("end", () => resolve(data));
   });
+}
+
+function deriveSkinAging(data: any): "low" | "medium" | "high" {
+  let score = 0;
+  if (data.sleepHours < 6) score += 2; else if (data.sleepHours < 7) score += 1;
+  if (data.stressLevel === "high") score += 2;
+  if (data.sittingHours > 8) score += 1;
+  if (data.screenBeforeBed === "always") score += 1;
+  return score >= 4 ? "high" : score >= 2 ? "medium" : "low";
+}
+
+function deriveHairGray(data: any): "low" | "medium" | "high" {
+  let score = 0;
+  if (data.stressLevel === "high") score += 2;
+  if (data.sleepQuality === "poor") score += 1;
+  return score >= 3 ? "high" : score >= 1 ? "medium" : "low";
+}
+
+function deriveHairLoss(data: any): "low" | "medium" | "high" {
+  let score = 0;
+  if (data.dietQuality === "mostly processed") score += 2;
+  if (data.exerciseFrequency === "rarely" || data.exerciseFrequency === "never") score += 1;
+  if (data.stressLevel === "high") score += 1;
+  return score >= 3 ? "high" : score >= 1 ? "medium" : "low";
+}
+
+// Helper: look up Betterness token for a Telegram user
+async function getBetternessToken(telegramUserId: string): Promise<string | null> {
+  const result = await pool.query(
+    `SELECT bc."encryptedToken" FROM "BetternessConnection" bc
+     JOIN "TelegramPairing" tp ON bc."userId" = tp."userId"
+     WHERE tp."telegramUserId" = $1`,
+    [telegramUserId]
+  );
+  return result.rows[0]?.encryptedToken ?? null;
+}
+
+// Helper: look up userId from telegramUserId
+async function getUserIdByTelegram(telegramUserId: string): Promise<string | null> {
+  const result = await pool.query(
+    `SELECT "userId" FROM "TelegramPairing" WHERE "telegramUserId" = $1`,
+    [telegramUserId]
+  );
+  return result.rows[0]?.userId ?? null;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -70,23 +178,14 @@ const server = http.createServer(async (req, res) => {
 
       if (!verifyRes.ok) {
         res.writeHead(verifyRes.status, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: verifyData.error || "Verification failed" }));
+        res.end(JSON.stringify({ error: (verifyData as any).error || "Verification failed" }));
         return;
       }
 
-      // If website returned a betterness token, store it locally
-      if (verifyData.betternessToken) {
-        db.prepare(`
-          INSERT INTO user_tokens (telegram_user_id, betterness_token)
-          VALUES (?, ?)
-          ON CONFLICT(telegram_user_id) DO UPDATE SET
-            betterness_token = excluded.betterness_token
-        `).run(telegramUserId, verifyData.betternessToken);
-        console.log(`Stored betterness token for telegram user ${telegramUserId}`);
-      }
+      console.log(`Pairing verified for telegram user ${telegramUserId}`);
 
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, userName: verifyData.userName }));
+      res.end(JSON.stringify({ success: true, userName: (verifyData as any).userName }));
     } catch (err) {
       console.error("Verify pairing error:", err);
       res.writeHead(500, { "Content-Type": "application/json" });
@@ -108,16 +207,14 @@ const server = http.createServer(async (req, res) => {
       }
 
       // Look up Betterness token
-      const row = db.prepare("SELECT betterness_token FROM user_tokens WHERE telegram_user_id = ?")
-        .get(telegramUserId) as { betterness_token: string } | undefined;
+      const token = await getBetternessToken(telegramUserId);
 
-      if (!row?.betterness_token) {
+      if (!token) {
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "No Betterness token found for this user" }));
         return;
       }
 
-      const token = row.betterness_token;
       const headers = {
         "Content-Type": "application/json",
         Accept: "application/json, text/event-stream",
@@ -173,7 +270,6 @@ const server = http.createServer(async (req, res) => {
           });
           const contentType = r.headers.get("content-type") || "";
           if (contentType.includes("text/event-stream")) {
-            // Parse SSE response — extract JSON from data: lines
             const text = await r.text();
             const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
             if (dataLine) return JSON.parse(dataLine.slice(5));
@@ -260,11 +356,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Generate future self image - no auth (localhost only)
+  // Generate future self video - async with polling (localhost only)
   if (req.method === "POST" && url.pathname === "/api/generate-future-self") {
     try {
       const body = JSON.parse(await readBody(req));
-      const { photoPath, lifestyleData, mode, habitChosen } = body;
+      const { photoPath, lifestyleData, mode, telegramUserId } = body;
 
       if (!photoPath || !lifestyleData || !mode) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -278,17 +374,96 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      console.log(`Generating future self (${mode}) for ${photoPath}...`);
-      const imagePath = await generateFutureSelf(photoPath, lifestyleData, mode, habitChosen);
-      console.log(`Generated: ${imagePath}`);
+      const jobId = crypto.randomUUID();
+      if (!fs.existsSync(PHOTOS_DIR)) fs.mkdirSync(PHOTOS_DIR, { recursive: true });
+      const outputPath = path.join(PHOTOS_DIR, `${jobId}.mp4`);
+      const scenario = mode === "bad_trajectory" ? "unhealthy" : "healthy";
 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ imagePath }));
+      const skinAging = mode === "good_trajectory" ? "low" : deriveSkinAging(lifestyleData);
+      const hairGray = mode === "good_trajectory" ? "low" : deriveHairGray(lifestyleData);
+      const hairLoss = mode === "good_trajectory" ? "low" : deriveHairLoss(lifestyleData);
+
+      // Look up userId for the relation
+      const userId = telegramUserId ? await getUserIdByTelegram(telegramUserId) : null;
+
+      await pool.query(
+        `INSERT INTO "GenerationJob" (id, "userId", "telegramUserId", mode, status, "createdAt")
+         VALUES ($1, $2, $3, $4, 'pending', now())`,
+        [jobId, userId || "unknown", telegramUserId || "unknown", mode]
+      );
+
+      console.log(`Starting morph job ${jobId} (${mode}) for ${photoPath}...`);
+
+      const proc = spawn(PYTHON_BIN, [
+        "scripts/aging_morph.py",
+        "--input", photoPath,
+        "--output", outputPath,
+        "--backend", "hidream_e1",
+        "--scenario", scenario,
+        "--skin-aging", skinAging,
+        "--hair-gray", hairGray,
+        "--hair-loss", hairLoss,
+        "--duration", "8",
+      ], { cwd: PROJECT_ROOT, env: { ...process.env } });
+
+      let stderr = "";
+      proc.stderr?.on("data", (chunk) => { stderr += chunk.toString(); });
+
+      proc.on("error", async (err) => {
+        await pool.query(
+          `UPDATE "GenerationJob" SET status = 'failed', error = $1, "completedAt" = now() WHERE id = $2`,
+          [err.message, jobId]
+        );
+        console.error(`Job ${jobId} spawn error: ${err.message}`);
+      });
+
+      proc.on("close", async (code) => {
+        if (code === 0) {
+          await pool.query(
+            `UPDATE "GenerationJob" SET status = 'completed', "videoPath" = $1, "completedAt" = now() WHERE id = $2`,
+            [outputPath, jobId]
+          );
+          console.log(`Job ${jobId} completed: ${outputPath}`);
+        } else {
+          const errMsg = stderr.trim().split("\n").pop() || `Exit code ${code}`;
+          await pool.query(
+            `UPDATE "GenerationJob" SET status = 'failed', error = $1, "completedAt" = now() WHERE id = $2`,
+            [errMsg, jobId]
+          );
+          console.error(`Job ${jobId} failed (code ${code}): ${errMsg}`);
+        }
+      });
+
+      res.writeHead(202, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ jobId, status: "pending" }));
     } catch (err) {
       console.error("Generate future self error:", err);
       res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Failed to generate future self image" }));
+      res.end(JSON.stringify({ error: "Failed to start generation job" }));
     }
+    return;
+  }
+
+  // Poll job status - no auth (localhost only)
+  if (req.method === "GET" && url.pathname.startsWith("/api/job-status/")) {
+    const jobId = url.pathname.split("/").pop();
+    const result = await pool.query(
+      `SELECT id, status, "videoPath", error FROM "GenerationJob" WHERE id = $1`,
+      [jobId]
+    );
+    if (result.rows.length === 0) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Job not found" }));
+      return;
+    }
+    const job = result.rows[0];
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      jobId: job.id,
+      status: job.status,
+      videoPath: job.videoPath,
+      error: job.error,
+    }));
     return;
   }
 
@@ -305,9 +480,305 @@ const server = http.createServer(async (req, res) => {
 
     const data = fs.readFileSync(filePath);
     const ext = path.extname(filename).toLowerCase();
-    const mime = ext === ".png" ? "image/png" : "image/jpeg";
+    const mimeTypes: Record<string, string> = {
+      ".png": "image/png",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".mp4": "video/mp4",
+    };
+    const mime = mimeTypes[ext] || "application/octet-stream";
     res.writeHead(200, { "Content-Type": mime, "Content-Length": data.length });
     res.end(data);
+    return;
+  }
+
+  // POST /api/daily-log — store a check-in
+  if (req.method === "POST" && url.pathname === "/api/daily-log") {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const { telegramUserId, date, checkinType, wellbeing, moodLabel, bodyStatus,
+              painLocation, painSeverity, sleepSelfReport, expectedDayLoad,
+              didActiveHabit, habitNotes, notes } = body;
+      if (!telegramUserId || !date) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "telegramUserId and date are required" }));
+        return;
+      }
+
+      const userId = await getUserIdByTelegram(telegramUserId) || "unknown";
+
+      await pool.query(
+        `INSERT INTO "DailyLog" ("userId", "telegramUserId", date, "checkinType", wellbeing, "moodLabel",
+          "bodyStatus", "painLocation", "painSeverity", "sleepSelfReport", "expectedDayLoad",
+          "didActiveHabit", "habitNotes", notes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+         ON CONFLICT ("telegramUserId", date, "checkinType") DO UPDATE SET
+          wellbeing = EXCLUDED.wellbeing, "moodLabel" = EXCLUDED."moodLabel",
+          "bodyStatus" = EXCLUDED."bodyStatus", "painLocation" = EXCLUDED."painLocation",
+          "painSeverity" = EXCLUDED."painSeverity", "sleepSelfReport" = EXCLUDED."sleepSelfReport",
+          "expectedDayLoad" = EXCLUDED."expectedDayLoad", "didActiveHabit" = EXCLUDED."didActiveHabit",
+          "habitNotes" = EXCLUDED."habitNotes", notes = EXCLUDED.notes,
+          "checkinTime" = now()`,
+        [userId, telegramUserId, date, checkinType || "morning", wellbeing ?? null,
+          moodLabel ?? null, bodyStatus ?? "fine", painLocation ?? null,
+          painSeverity ?? null, sleepSelfReport ?? null, expectedDayLoad ?? null,
+          didActiveHabit ?? null, habitNotes ?? null, notes ?? null]
+      );
+
+      // Update last_user_message timestamp
+      await pool.query(
+        `UPDATE "UserPreferences" SET "lastUserMessage" = now(), "updatedAt" = now()
+         WHERE "telegramUserId" = $1`,
+        [telegramUserId]
+      );
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: true }));
+    } catch (err) {
+      console.error("Daily log error:", err);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Failed to store daily log" }));
+    }
+    return;
+  }
+
+  // GET /api/daily-log/:userId/summary?days=7
+  if (req.method === "GET" && url.pathname.match(/^\/api\/daily-log\/[^/]+\/summary$/)) {
+    try {
+      const userId = url.pathname.split("/")[3];
+      const days = parseInt(url.searchParams.get("days") || "7", 10);
+
+      const result = await pool.query(
+        `SELECT * FROM "DailyLog"
+         WHERE "telegramUserId" = $1 AND date >= (CURRENT_DATE - $2 * INTERVAL '1 day')::text
+         ORDER BY date DESC, "checkinType"`,
+        [userId, days]
+      );
+      const logs = result.rows;
+
+      const wellbeingValues = logs.map((l: any) => l.wellbeing).filter((v: any): v is number => v != null);
+      const avgWellbeing = wellbeingValues.length > 0
+        ? Math.round((wellbeingValues.reduce((a: number, b: number) => a + b, 0) / wellbeingValues.length) * 10) / 10
+        : null;
+      const habitLogs = logs.filter((l: any) => l.didActiveHabit != null);
+      const habitCompletionRate = habitLogs.length > 0
+        ? Math.round((habitLogs.filter((l: any) => l.didActiveHabit === true).length / habitLogs.length) * 100)
+        : null;
+      const painMap: Record<string, number> = {};
+      for (const l of logs) {
+        if ((l as any).painLocation) {
+          painMap[(l as any).painLocation] = (painMap[(l as any).painLocation] || 0) + 1;
+        }
+      }
+      const painMentions = Object.entries(painMap).map(([location, count]) => ({ location, count }));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ logs, avgWellbeing, habitCompletionRate, painMentions }));
+    } catch (err) {
+      console.error("Daily log summary error:", err);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Failed to get summary" }));
+    }
+    return;
+  }
+
+  // GET /api/daily-log/:userId/trends
+  if (req.method === "GET" && url.pathname.match(/^\/api\/daily-log\/[^/]+\/trends$/)) {
+    try {
+      const userId = url.pathname.split("/")[3];
+
+      const weeklyResult = await pool.query(
+        `SELECT EXTRACT(WEEK FROM date::date) as week_num,
+                MIN(date) as week_start,
+                AVG(wellbeing) as avg_wellbeing,
+                CAST(SUM(CASE WHEN "didActiveHabit" = true THEN 1 ELSE 0 END) AS REAL) /
+                  NULLIF(SUM(CASE WHEN "didActiveHabit" IS NOT NULL THEN 1 ELSE 0 END), 0) as habit_rate
+         FROM "DailyLog"
+         WHERE "telegramUserId" = $1 AND wellbeing IS NOT NULL
+         GROUP BY week_num
+         ORDER BY week_num`,
+        [userId]
+      );
+      const weeklyAverages = weeklyResult.rows.map((r: any) => ({
+        weekStart: r.week_start,
+        avgWellbeing: Math.round(r.avg_wellbeing * 10) / 10,
+        habitRate: r.habit_rate != null ? Math.round(r.habit_rate * 100) : null,
+      }));
+
+      const painResult = await pool.query(
+        `SELECT "painLocation" as location, COUNT(*) as occurrences
+         FROM "DailyLog"
+         WHERE "telegramUserId" = $1 AND "painLocation" IS NOT NULL
+         GROUP BY "painLocation"
+         ORDER BY occurrences DESC`,
+        [userId]
+      );
+      const recurringPain = painResult.rows;
+
+      const totalDaysResult = await pool.query(
+        `SELECT COUNT(DISTINCT date) as cnt FROM "DailyLog" WHERE "telegramUserId" = $1`,
+        [userId]
+      );
+      const totalDays = parseInt(totalDaysResult.rows[0]?.cnt || "0", 10);
+
+      // Current streak: consecutive days with a log up to today
+      const allDatesResult = await pool.query(
+        `SELECT DISTINCT date FROM "DailyLog"
+         WHERE "telegramUserId" = $1 ORDER BY date DESC`,
+        [userId]
+      );
+      let currentStreak = 0;
+      const today = new Date();
+      for (let i = 0; i < allDatesResult.rows.length; i++) {
+        const expected = new Date(today);
+        expected.setDate(expected.getDate() - i);
+        const expectedStr = expected.toISOString().split("T")[0];
+        if (allDatesResult.rows[i].date === expectedStr) {
+          currentStreak++;
+        } else {
+          break;
+        }
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ weeklyAverages, recurringPain, totalDays, currentStreak }));
+    } catch (err) {
+      console.error("Trends error:", err);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Failed to get trends" }));
+    }
+    return;
+  }
+
+  // POST /api/user-preferences — upsert
+  if (req.method === "POST" && url.pathname === "/api/user-preferences") {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const { telegramUserId, ...fields } = body;
+      if (!telegramUserId) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "telegramUserId is required" }));
+        return;
+      }
+
+      const allowedFields: Record<string, string> = {
+        timezone: "timezone",
+        morningCheckinTime: "morningCheckinTime",
+        eveningCheckinTime: "eveningCheckinTime",
+        checkinIntensity: "checkinIntensity",
+        dndStart: "dndStart",
+        dndEnd: "dndEnd",
+        onboardingComplete: "onboardingComplete",
+        activeHabit: "activeHabit",
+        habitStartDate: "habitStartDate",
+        lastVideoRefresh: "lastVideoRefresh",
+        baselineWeekEnd: "baselineWeekEnd",
+        lastMorningSent: "lastMorningSent",
+        lastEveningSent: "lastEveningSent",
+        lastWeeklySent: "lastWeeklySent",
+        lastUserMessage: "lastUserMessage",
+        lastTemplateIdx: "lastTemplateIdx",
+      };
+
+      // Build dynamic update
+      const setClauses: string[] = [`"updatedAt" = now()`];
+      const values: any[] = [];
+      let paramIdx = 1;
+
+      for (const [key, val] of Object.entries(fields)) {
+        const dbField = allowedFields[key];
+        if (dbField && val !== undefined) {
+          setClauses.push(`"${dbField}" = $${paramIdx}`);
+          values.push(val);
+          paramIdx++;
+        }
+      }
+
+      // Look up userId for the relation
+      const userId = await getUserIdByTelegram(telegramUserId);
+
+      // Upsert
+      values.push(telegramUserId);
+      const telegramParam = `$${paramIdx}`;
+      paramIdx++;
+      values.push(userId || "unknown");
+      const userIdParam = `$${paramIdx}`;
+
+      await pool.query(
+        `INSERT INTO "UserPreferences" (id, "userId", "telegramUserId", "createdAt", "updatedAt")
+         VALUES (gen_random_uuid()::text, ${userIdParam}, ${telegramParam}, now(), now())
+         ON CONFLICT ("telegramUserId") DO UPDATE SET ${setClauses.join(", ")}`,
+        values
+      );
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: true }));
+    } catch (err) {
+      console.error("User preferences error:", err);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Failed to update preferences" }));
+    }
+    return;
+  }
+
+  // GET /api/user-preferences/:userId
+  if (req.method === "GET" && url.pathname.match(/^\/api\/user-preferences\/[^/]+$/)) {
+    try {
+      const userId = url.pathname.split("/").pop();
+      const result = await pool.query(
+        `SELECT * FROM "UserPreferences" WHERE "telegramUserId" = $1`,
+        [userId]
+      );
+      if (result.rows.length === 0) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "User preferences not found" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(result.rows[0]));
+    } catch (err) {
+      console.error("Get preferences error:", err);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Failed to get preferences" }));
+    }
+    return;
+  }
+
+  // POST /api/send-telegram-message — proactive messaging
+  if (req.method === "POST" && url.pathname === "/api/send-telegram-message") {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const { telegramUserId, text, parseMode } = body;
+      if (!telegramUserId || !text) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "telegramUserId and text are required" }));
+        return;
+      }
+      if (!TELEGRAM_BOT_TOKEN) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "TELEGRAM_BOT_TOKEN not configured" }));
+        return;
+      }
+      const tgBody: Record<string, string> = {
+        chat_id: telegramUserId,
+        text,
+      };
+      if (parseMode) tgBody.parse_mode = parseMode;
+      const tgRes = await fetch(
+        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(tgBody),
+        }
+      );
+      const tgData = await tgRes.json();
+      res.writeHead(tgRes.ok ? 200 : 502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(tgData));
+    } catch (err) {
+      console.error("Send telegram message error:", err);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Failed to send message" }));
+    }
     return;
   }
 
@@ -330,17 +801,9 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // Upsert user token - use username as fallback ID if no telegram user ID
-      const id = telegramUserId || telegramUsername || "unknown";
-      db.prepare(`
-        INSERT INTO user_tokens (telegram_user_id, betterness_token, telegram_username)
-        VALUES (?, ?, ?)
-        ON CONFLICT(telegram_user_id) DO UPDATE SET
-          betterness_token = excluded.betterness_token,
-          telegram_username = excluded.telegram_username
-      `).run(id, betternessToken, telegramUsername || null);
-
-      console.log(`Provisioned user: ${telegramUsername || id}`);
+      // The Betterness token is now stored in BetternessConnection by the web app.
+      // This endpoint is kept for backward compatibility but no longer stores tokens directly.
+      console.log(`Provision request for user: ${telegramUsername || telegramUserId || "unknown"}`);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ success: true }));
     } catch (err) {
@@ -363,13 +826,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // Update the user record with the actual telegram user ID
-      if (telegramUsername) {
-        db.prepare(`
-          UPDATE user_tokens SET telegram_user_id = ? WHERE telegram_username = ?
-        `).run(telegramUserId, telegramUsername);
-      }
-
+      // Pairing approval now happens via the web app's TelegramPairing table
       console.log(`Pairing approved: ${telegramUsername} -> ${telegramUserId}`);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ success: true }));
@@ -385,6 +842,12 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ error: "Not found" }));
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Provisioning API running on http://0.0.0.0:${PORT}`);
+// Start server after DB init
+initDb().then(() => {
+  server.listen(PORT, "0.0.0.0", () => {
+    console.log(`Provisioning API running on http://0.0.0.0:${PORT}`);
+  });
+}).catch((err) => {
+  console.error("Failed to initialize database:", err);
+  process.exit(1);
 });

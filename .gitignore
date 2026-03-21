@@ -46,3 +46,15 @@ prisma/dev.db
 prisma/dev.db-journal
 ec2/node_modules
 ec2/users.db
+
+# OpenTofu / Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+.terraform.lock.hcl
+
+# SQLite (legacy - migrated to PostgreSQL)
+*.db
+*.db-journal
+seed.db

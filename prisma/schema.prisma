@@ -1,11 +1,14 @@
 generator client {
-  provider = "prisma-client"
+  provider = "prisma-client-js"
   output   = "../src/generated/prisma"
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
+
+// ─── Web App Models (migrated from SQLite) ──────────────────────────────────
 
 model User {
   id           String   @id @default(cuid())
@@ -16,6 +19,9 @@ model User {
 
   betternessConnection BetternessConnection?
   telegramPairing      TelegramPairing?
+  preferences          UserPreferences?
+  dailyLogs            DailyLog[]
+  generationJobs       GenerationJob[]
 }
 
 model BetternessConnection {
@@ -31,10 +37,75 @@ model TelegramPairing {
   id               String   @id @default(cuid())
   userId           String   @unique
   telegramUsername  String?
-  telegramUserId   String?
+  telegramUserId   String?  @unique
   pairingCode      String   @unique
   approved         Boolean  @default(false)
   createdAt        DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ─── EC2 Models (migrated from users.db SQLite) ─────────────────────────────
+
+model UserPreferences {
+  id                 String    @id @default(cuid())
+  userId             String    @unique
+  telegramUserId     String    @unique
+  timezone           String    @default("America/New_York")
+  morningCheckinTime String    @default("08:00")
+  eveningCheckinTime String    @default("21:00")
+  checkinIntensity   String    @default("normal")
+  dndStart           String?
+  dndEnd             String?
+  onboardingComplete Boolean   @default(false)
+  activeHabit        String?
+  habitStartDate     String?
+  lastVideoRefresh   String?
+  baselineWeekEnd    String?
+  lastMorningSent    String?
+  lastEveningSent    String?
+  lastWeeklySent     String?
+  lastUserMessage    DateTime?
+  lastTemplateIdx    Int       @default(0)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model DailyLog {
+  id               Int       @id @default(autoincrement())
+  userId           String
+  telegramUserId   String
+  date             String
+  checkinType      String    @default("morning")
+  wellbeing        Int?
+  moodLabel        String?
+  bodyStatus       String    @default("fine")
+  painLocation     String?
+  painSeverity     Int?
+  sleepSelfReport  String?
+  expectedDayLoad  String?
+  didActiveHabit   Boolean?
+  habitNotes       String?
+  notes            String?
+  checkinTime      DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([telegramUserId, date, checkinType])
+}
+
+model GenerationJob {
+  id             String    @id @default(cuid())
+  userId         String
+  telegramUserId String
+  mode           String
+  status         String    @default("pending")
+  videoPath      String?
+  error          String?
+  createdAt      DateTime  @default(now())
+  completedAt    DateTime?
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
