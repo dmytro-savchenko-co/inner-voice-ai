@@ -1,0 +1,36 @@
+version: 0.2
+
+env:
+  variables:
+    AWS_ACCOUNT_ID: "211125596327"
+    AWS_REGION: "us-east-1"
+    ECR_REPO_PREFIX: "innervoice-dev"
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:-latest}
+
+  build:
+    commands:
+      - echo Building platform image...
+      - docker build -f infra/Dockerfiles/Dockerfile.platform -t $ECR_REPO_PREFIX/platform .
+      - docker tag $ECR_REPO_PREFIX/platform $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_PREFIX/platform:$IMAGE_TAG
+      - docker tag $ECR_REPO_PREFIX/platform $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_PREFIX/platform:latest
+
+      - echo Building scheduler image...
+      - docker build -f infra/Dockerfiles/Dockerfile.scheduler -t $ECR_REPO_PREFIX/scheduler .
+      - docker tag $ECR_REPO_PREFIX/scheduler $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_PREFIX/scheduler:$IMAGE_TAG
+      - docker tag $ECR_REPO_PREFIX/scheduler $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_PREFIX/scheduler:latest
+
+  post_build:
+    commands:
+      - echo Pushing images to ECR...
+      - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_PREFIX/platform:$IMAGE_TAG
+      - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_PREFIX/platform:latest
+      - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_PREFIX/scheduler:$IMAGE_TAG
+      - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_PREFIX/scheduler:latest
+      - echo Build completed on $(date)
