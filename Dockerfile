@@ -3,7 +3,8 @@ FROM node:22-alpine AS base
 FROM base AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci
+# Cache bust: force fresh install when deps change
+RUN npm ci --force
 
 FROM base AS builder
 WORKDIR /app
