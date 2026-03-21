@@ -1,23 +1,26 @@
 FROM public.ecr.aws/docker/library/node:22-alpine AS base
 WORKDIR /app
 
-# Install Python for aging_morph.py (Replicate handles GPU, this just calls the API)
-RUN apk add --no-cache python3 py3-pip
-
 FROM base AS deps
+# Install build tools needed for canvas native module
+RUN apk add --no-cache python3 make g++ pkgconfig pixman-dev cairo-dev pango-dev jpeg-dev giflib-dev librsvg-dev
 COPY ec2/package.json ec2/package-lock.json ./
 RUN npm ci --omit=dev
 
 FROM base AS runner
 WORKDIR /app
 ENV NODE_ENV=production
+
+# Runtime deps for canvas + python
+RUN apk add --no-cache python3 py3-pip cairo pango jpeg giflib librsvg pixman
+
 COPY --from=deps /app/node_modules ./node_modules
 COPY ec2/provision-api.ts ec2/proxy.ts ec2/pairing-mcp.ts ./
 COPY ec2/image-gen.ts ./
 COPY scripts/aging_morph.py scripts/requirements-aging.txt ./scripts/
 
 # Install Python deps for aging script
-RUN pip3 install --no-cache-dir -r scripts/requirements-aging.txt 2>/dev/null || true
+RUN pip3 install --break-system-packages --no-cache-dir -r scripts/requirements-aging.txt 2>/dev/null || true
 
 EXPOSE 3001 3002
 CMD ["sh", "-c", "npx tsx proxy.ts & npx tsx provision-api.ts"]
