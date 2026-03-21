@@ -6,6 +6,7 @@ const TICK_INTERVAL_MS = 60_000; // 1 minute
 
 const pool = new pg.Pool({
   connectionString: DATABASE_URL,
+  ssl: DATABASE_URL.includes("rds.amazonaws.com") ? { rejectUnauthorized: false } : undefined,
   max: 5,
   idleTimeoutMillis: 30000,
 });

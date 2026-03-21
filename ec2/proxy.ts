@@ -1,34 +1,35 @@
 import http from "node:http";
 import https from "node:https";
-import Database from "better-sqlite3";
-import path from "node:path";
+import pg from "pg";
 
 const PORT = 3001;
 const BETTERNESS_MCP_URL = "https://api.betterness.ai/mcp";
-const DB_PATH = path.join(__dirname, "users.db");
+const DATABASE_URL = process.env.DATABASE_URL || "";
 
-const db = new Database(DB_PATH);
-db.exec(`
-  CREATE TABLE IF NOT EXISTS user_tokens (
-    telegram_user_id TEXT PRIMARY KEY,
-    betterness_token TEXT NOT NULL,
-    telegram_username TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-  )
-`);
+const pool = new pg.Pool({
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL.includes("rds.amazonaws.com") ? { rejectUnauthorized: false } : undefined,
+  max: 5,
+});
 
-function getTokenForUser(telegramUserId: string): string | undefined {
-  const row = db.prepare("SELECT betterness_token FROM user_tokens WHERE telegram_user_id = ?").get(telegramUserId) as
-    | { betterness_token: string }
-    | undefined;
-  return row?.betterness_token;
+async function getTokenForUser(telegramUserId: string): Promise<string | undefined> {
+  const result = await pool.query(
+    `SELECT bc."encryptedToken" FROM "BetternessConnection" bc
+     JOIN "TelegramPairing" tp ON bc."userId" = tp."userId"
+     WHERE tp."telegramUserId" = $1`,
+    [telegramUserId]
+  );
+  return result.rows[0]?.encryptedToken;
 }
 
-function getTokenByUsername(username: string): string | undefined {
-  const row = db
-    .prepare("SELECT betterness_token FROM user_tokens WHERE telegram_username = ?")
-    .get(username) as { betterness_token: string } | undefined;
-  return row?.betterness_token;
+async function getTokenByUsername(username: string): Promise<string | undefined> {
+  const result = await pool.query(
+    `SELECT bc."encryptedToken" FROM "BetternessConnection" bc
+     JOIN "TelegramPairing" tp ON bc."userId" = tp."userId"
+     WHERE tp."telegramUsername" = $1`,
+    [username]
+  );
+  return result.rows[0]?.encryptedToken;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -50,10 +51,10 @@ const server = http.createServer(async (req, res) => {
 
   let token: string | undefined;
   if (telegramUserId) {
-    token = getTokenForUser(telegramUserId);
+    token = await getTokenForUser(telegramUserId);
   }
   if (!token && telegramUsername) {
-    token = getTokenByUsername(telegramUsername);
+    token = await getTokenByUsername(telegramUsername);
   }
 
   if (!token) {
@@ -91,6 +92,6 @@ const server = http.createServer(async (req, res) => {
   proxyReq.end();
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`Betterness MCP Proxy running on http://127.0.0.1:${PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Betterness MCP Proxy running on http://0.0.0.0:${PORT}`);
 });

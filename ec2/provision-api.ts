@@ -18,6 +18,7 @@ const PYTHON_BIN = path.join(PROJECT_ROOT, ".venv", "bin", "python3");
 // PostgreSQL connection pool
 const pool = new pg.Pool({
   connectionString: DATABASE_URL,
+  ssl: DATABASE_URL.includes("rds.amazonaws.com") ? { rejectUnauthorized: false } : undefined,
   max: 10,
   idleTimeoutMillis: 30000,
 });
