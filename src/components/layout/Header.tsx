@@ -34,6 +34,12 @@ export default function Header() {
             </a>
           ))}
           <Link
+            href="/login"
+            className="text-sm font-medium text-muted transition-colors hover:text-foreground"
+          >
+            Sign In
+          </Link>
+          <Link
             href="/register"
             className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-primary-light"
           >
@@ -77,6 +83,13 @@ export default function Header() {
                 {link.label}
               </a>
             ))}
+            <Link
+              href="/login"
+              onClick={() => setMobileOpen(false)}
+              className="rounded-lg px-3 py-2 text-sm font-medium text-muted transition-colors hover:bg-card hover:text-foreground"
+            >
+              Sign In
+            </Link>
             <Link
               href="/register"
               onClick={() => setMobileOpen(false)}
