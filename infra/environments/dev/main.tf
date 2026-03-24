@@ -128,6 +128,10 @@ module "secrets" {
       description   = "JWT signing secret for web app authentication"
       default_value = "CHANGE_ME"
     }
+    "anthropic-api-key" = {
+      description   = "Anthropic API key for Claude LLM (used by OpenClaw)"
+      default_value = "CHANGE_ME"
+    }
   }
 }
 
@@ -202,6 +206,7 @@ module "platform_service" {
     DATABASE_URL        = module.database.database_url
     WEBSITE_URL         = "https://elegant-stillness-production.up.railway.app"
     BETTERNESS_MCP_URL  = "https://api.betterness.ai/mcp"
+    OPENCLAW_API_URL    = "http://${module.openclaw_ec2.private_ip}:18790"
   }
 
   secrets = {
@@ -237,6 +242,26 @@ module "scheduler_service" {
   }
 
   secrets = {}
+}
+
+# ─── Phase 2: OpenClaw EC2 Instance ──────────────────────────────────────────
+
+module "openclaw_ec2" {
+  source = "../../modules/openclaw-ec2"
+
+  project_name          = var.project_name
+  environment           = var.environment
+  vpc_id                = module.networking.vpc_id
+  subnet_id             = module.networking.public_subnet_ids[0]
+  instance_type         = "t3.medium"
+  key_name              = "openclaw-key"
+  ebs_volume_size       = 30
+  ecs_security_group_id = module.networking.ecs_security_group_id
+
+  secret_arns = {
+    "anthropic-api-key"  = module.secrets.secret_arns["anthropic-api-key"]
+    "telegram-bot-token" = module.secrets.secret_arns["telegram-bot-token"]
+  }
 }
 
 # ─── Outputs ─────────────────────────────────────────────────────────────────
@@ -275,4 +300,14 @@ output "ecr_repository_urls" {
 output "vpc_id" {
   description = "VPC ID"
   value       = module.networking.vpc_id
+}
+
+output "openclaw_public_ip" {
+  description = "Public IP of the OpenClaw EC2 instance"
+  value       = module.openclaw_ec2.public_ip
+}
+
+output "openclaw_instance_id" {
+  description = "Instance ID of the OpenClaw EC2 instance"
+  value       = module.openclaw_ec2.instance_id
 }

@@ -16,6 +16,7 @@ export async function GET() {
         name: user.name,
         betternessConnected: !!user.betternessConnection,
         telegramPaired: !!user.telegramPairing,
+        telegramUserId: user.telegramPairing?.telegramUserId ?? null,
       },
     });
   } catch (error) {
