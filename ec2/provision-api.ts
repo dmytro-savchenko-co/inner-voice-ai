@@ -811,6 +811,62 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Usage endpoints (no auth — called by agent-manager on EC2)
+  if (req.method === "POST" && url.pathname === "/api/usage/log") {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const { telegramUserId, sessionId, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, model, durationMs } = body;
+      if (!telegramUserId) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "telegramUserId is required" }));
+        return;
+      }
+      await pool.query(
+        `INSERT INTO "UsageLog" ("telegramUserId", "sessionId", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", model, "durationMs")
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [telegramUserId, sessionId || null, inputTokens || 0, outputTokens || 0, cacheReadTokens || 0, cacheWriteTokens || 0, model || null, durationMs || null]
+      );
+      res.writeHead(201, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: true }));
+    } catch (err: any) {
+      console.error("Usage log error:", err);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/usage/summary") {
+    try {
+      const userId = url.searchParams.get("userId");
+      const days = parseInt(url.searchParams.get("days") || "30", 10);
+      if (!userId) { res.writeHead(400, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "userId required" })); return; }
+      const summary = await pool.query(
+        `SELECT COUNT(*) as total_requests, COALESCE(SUM("inputTokens"),0) as total_input, COALESCE(SUM("outputTokens"),0) as total_output,
+         COALESCE(SUM("cacheReadTokens"),0) as total_cache_read, COALESCE(SUM("cacheWriteTokens"),0) as total_cache_write, COALESCE(AVG("durationMs"),0) as avg_duration
+         FROM "UsageLog" WHERE "telegramUserId" = $1 AND "createdAt" > NOW() - INTERVAL '1 day' * $2`, [userId, days]);
+      const daily = await pool.query(
+        `SELECT DATE("createdAt") as date, COUNT(*) as requests, SUM("inputTokens") as input_tokens, SUM("outputTokens") as output_tokens
+         FROM "UsageLog" WHERE "telegramUserId" = $1 AND "createdAt" > NOW() - INTERVAL '1 day' * $2
+         GROUP BY DATE("createdAt") ORDER BY date DESC`, [userId, days]);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ summary: summary.rows[0], daily: daily.rows }));
+    } catch (err: any) { res.writeHead(500, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: err.message })); }
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/usage/recent") {
+    try {
+      const userId = url.searchParams.get("userId");
+      const limit = parseInt(url.searchParams.get("limit") || "20", 10);
+      if (!userId) { res.writeHead(400, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "userId required" })); return; }
+      const result = await pool.query(`SELECT * FROM "UsageLog" WHERE "telegramUserId" = $1 ORDER BY "createdAt" DESC LIMIT $2`, [userId, limit]);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ entries: result.rows }));
+    } catch (err: any) { res.writeHead(500, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: err.message })); }
+    return;
+  }
+
   // All other routes require auth
   if (!authenticate(req)) {
     res.writeHead(401, { "Content-Type": "application/json" });
@@ -881,93 +937,6 @@ const server = http.createServer(async (req, res) => {
     } catch (err: any) {
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Agent manager unavailable" }));
-    }
-    return;
-  }
-
-  // POST /api/usage/log — log a usage entry
-  if (req.method === "POST" && url.pathname === "/api/usage/log") {
-    try {
-      const body = JSON.parse(await readBody(req));
-      const { telegramUserId, sessionId, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, model, durationMs } = body;
-      if (!telegramUserId) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "telegramUserId is required" }));
-        return;
-      }
-      await pool.query(
-        `INSERT INTO "UsageLog" ("telegramUserId", "sessionId", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", model, "durationMs")
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [telegramUserId, sessionId || null, inputTokens || 0, outputTokens || 0, cacheReadTokens || 0, cacheWriteTokens || 0, model || null, durationMs || null]
-      );
-      res.writeHead(201, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true }));
-    } catch (err: any) {
-      console.error("Usage log error:", err);
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
-    }
-    return;
-  }
-
-  // GET /api/usage/summary?userId=X&days=30
-  if (req.method === "GET" && url.pathname === "/api/usage/summary") {
-    try {
-      const userId = url.searchParams.get("userId");
-      const days = parseInt(url.searchParams.get("days") || "30", 10);
-      if (!userId) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "userId is required" }));
-        return;
-      }
-      const summary = await pool.query(
-        `SELECT
-           COUNT(*) as total_requests,
-           COALESCE(SUM("inputTokens"), 0) as total_input,
-           COALESCE(SUM("outputTokens"), 0) as total_output,
-           COALESCE(SUM("cacheReadTokens"), 0) as total_cache_read,
-           COALESCE(SUM("cacheWriteTokens"), 0) as total_cache_write,
-           COALESCE(AVG("durationMs"), 0) as avg_duration
-         FROM "UsageLog"
-         WHERE "telegramUserId" = $1 AND "createdAt" > NOW() - INTERVAL '1 day' * $2`,
-        [userId, days]
-      );
-      const daily = await pool.query(
-        `SELECT DATE("createdAt") as date, COUNT(*) as requests,
-           SUM("inputTokens") as input_tokens, SUM("outputTokens") as output_tokens
-         FROM "UsageLog"
-         WHERE "telegramUserId" = $1 AND "createdAt" > NOW() - INTERVAL '1 day' * $2
-         GROUP BY DATE("createdAt") ORDER BY date DESC`,
-        [userId, days]
-      );
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ summary: summary.rows[0], daily: daily.rows }));
-    } catch (err: any) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
-    }
-    return;
-  }
-
-  // GET /api/usage/recent?userId=X&limit=20
-  if (req.method === "GET" && url.pathname === "/api/usage/recent") {
-    try {
-      const userId = url.searchParams.get("userId");
-      const limit = parseInt(url.searchParams.get("limit") || "20", 10);
-      if (!userId) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "userId is required" }));
-        return;
-      }
-      const result = await pool.query(
-        `SELECT * FROM "UsageLog" WHERE "telegramUserId" = $1 ORDER BY "createdAt" DESC LIMIT $2`,
-        [userId, limit]
-      );
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ entries: result.rows }));
-    } catch (err: any) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
     }
     return;
   }
