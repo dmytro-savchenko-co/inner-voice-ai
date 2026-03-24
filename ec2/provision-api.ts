@@ -867,6 +867,24 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Agent status proxy (no auth — called by dashboard)
+  const agentStatusMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/status$/);
+  if (req.method === "GET" && agentStatusMatch && OPENCLAW_API_URL) {
+    try {
+      const agentId = agentStatusMatch[1];
+      const agentRes = await fetch(`${OPENCLAW_API_URL}/agents/${agentId}/status`, {
+        headers: { "x-api-key": API_KEY },
+      });
+      const data = await agentRes.json();
+      res.writeHead(agentRes.status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(data));
+    } catch (err: any) {
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Agent manager unavailable" }));
+    }
+    return;
+  }
+
   // All other routes require auth
   if (!authenticate(req)) {
     res.writeHead(401, { "Content-Type": "application/json" });
@@ -919,24 +937,6 @@ const server = http.createServer(async (req, res) => {
       console.error("Pairing error:", err);
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Invalid request body" }));
-    }
-    return;
-  }
-
-  // Agent status proxy — forwards to OpenClaw Agent Manager
-  const agentStatusMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/status$/);
-  if (req.method === "GET" && agentStatusMatch && OPENCLAW_API_URL) {
-    try {
-      const agentId = agentStatusMatch[1];
-      const agentRes = await fetch(`${OPENCLAW_API_URL}/agents/${agentId}/status`, {
-        headers: { "x-api-key": API_KEY },
-      });
-      const data = await agentRes.json();
-      res.writeHead(agentRes.status, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(data));
-    } catch (err: any) {
-      res.writeHead(502, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Agent manager unavailable" }));
     }
     return;
   }

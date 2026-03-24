@@ -16,7 +16,7 @@ export default function ConnectionsPage() {
       </div>
 
       <div className="space-y-4">
-        <BetternessCard connected={user.betternessConnected} />
+        <BetternessCard connected={user.betternessConnected} tokenMasked={user.betternessTokenMasked} />
         <TelegramCard paired={user.telegramPaired} />
       </div>
     </div>
@@ -25,11 +25,26 @@ export default function ConnectionsPage() {
 
 /* ── Betterness ─────────────────────────────────────────────────────────── */
 
-function BetternessCard({ connected }: { connected: boolean }) {
+function BetternessCard({ connected, tokenMasked }: { connected: boolean; tokenMasked: string | null }) {
   const [expanded, setExpanded] = useState(!connected);
   const [token, setToken] = useState("");
-  const [status, setStatus] = useState<"idle" | "loading" | "success" | "error">("idle");
+  const [status, setStatus] = useState<"idle" | "loading" | "success" | "error" | "disconnected">("idle");
   const [errorMessage, setErrorMessage] = useState("");
+  const [disconnecting, setDisconnecting] = useState(false);
+
+  async function handleDisconnect() {
+    setDisconnecting(true);
+    try {
+      const res = await fetch("/api/betterness/disconnect", { method: "POST" });
+      if (res.ok) {
+        setStatus("disconnected");
+      }
+    } catch {
+      // ignore
+    } finally {
+      setDisconnecting(false);
+    }
+  }
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -86,15 +101,41 @@ function BetternessCard({ connected }: { connected: boolean }) {
 
       {expanded && (
         <div className="border-t border-card-border/40 px-5 pb-5 pt-4">
-          {status === "success" ? (
+          {status === "disconnected" ? (
+            <>
+              <div className="mb-3 rounded-lg border border-amber-500/20 bg-amber-500/5 px-4 py-3">
+                <p className="text-sm font-medium text-amber-400">Disconnected</p>
+                <p className="mt-0.5 text-xs text-muted">Betterness has been disconnected. You can reconnect below.</p>
+              </div>
+              <form onSubmit={(e) => { setStatus("idle"); handleSubmit(e); }} className="space-y-3">
+                <input type="text" required value={token} onChange={(e) => setToken(e.target.value)} placeholder="bk_..." pattern="bk_.+" title="Token must start with bk_"
+                  className="w-full rounded-lg border border-card-border bg-background px-3 py-2 font-mono text-xs text-foreground placeholder:text-muted/50 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary" />
+                <button type="submit" className="rounded-lg bg-primary px-4 py-2 text-xs font-medium text-white transition-colors hover:bg-primary-light disabled:opacity-50">
+                  Reconnect
+                </button>
+              </form>
+            </>
+          ) : status === "success" ? (
             <div className="rounded-lg border border-primary/20 bg-primary/5 px-4 py-3">
               <p className="text-sm font-medium text-primary">Connected successfully</p>
               <p className="mt-0.5 text-xs text-muted">Your wearable data is now available to Inner Voice.</p>
             </div>
           ) : connected ? (
-            <div className="rounded-lg border border-primary/20 bg-primary/5 px-4 py-3">
-              <p className="text-sm font-medium text-primary">Betterness is connected</p>
-              <p className="mt-0.5 text-xs text-muted">Your sleep, HRV, and activity data flows into your coaching.</p>
+            <div className="space-y-3">
+              <div className="rounded-lg border border-primary/20 bg-primary/5 px-4 py-3">
+                <p className="text-sm font-medium text-primary">Betterness is connected</p>
+                <p className="mt-0.5 text-xs text-muted">Your sleep, HRV, and activity data flows into your coaching.</p>
+                {tokenMasked && (
+                  <p className="mt-2 font-mono text-[10px] text-muted/60">Token: {tokenMasked}</p>
+                )}
+              </div>
+              <button
+                onClick={handleDisconnect}
+                disabled={disconnecting}
+                className="text-xs text-red-400/70 transition-colors hover:text-red-400 disabled:opacity-50"
+              >
+                {disconnecting ? "Disconnecting..." : "Disconnect Betterness"}
+              </button>
             </div>
           ) : (
             <>

@@ -15,6 +15,9 @@ export async function GET() {
         email: user.email,
         name: user.name,
         betternessConnected: !!user.betternessConnection,
+        betternessTokenMasked: user.betternessConnection
+          ? `${user.betternessConnection.encryptedToken.slice(0, 6)}...${user.betternessConnection.encryptedToken.slice(-4)}`
+          : null,
         telegramPaired: !!user.telegramPairing,
         telegramUserId: user.telegramPairing?.telegramUserId ?? null,
       },

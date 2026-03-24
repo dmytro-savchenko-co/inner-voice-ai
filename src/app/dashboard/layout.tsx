@@ -9,6 +9,7 @@ interface User {
   email: string;
   name: string;
   betternessConnected: boolean;
+  betternessTokenMasked: string | null;
   telegramPaired: boolean;
   telegramUserId: string | null;
 }
@@ -152,7 +153,11 @@ export default function DashboardLayout({
 
           {/* User section at bottom */}
           <div className="border-t border-card-border/50 p-3">
-            <div className="flex items-center gap-3 rounded-lg px-3 py-2">
+            <Link
+              href="/dashboard/profile"
+              onClick={() => setSidebarOpen(false)}
+              className="flex items-center gap-3 rounded-lg px-3 py-2 transition-colors hover:bg-card-border/20"
+            >
               <div className="flex h-8 w-8 items-center justify-center rounded-full bg-primary/15 text-xs font-semibold text-primary">
                 {user.name?.charAt(0).toUpperCase() || "U"}
               </div>
@@ -160,7 +165,7 @@ export default function DashboardLayout({
                 <div className="truncate text-xs font-medium text-foreground">{user.name}</div>
                 <div className="truncate text-[10px] text-muted">{user.email}</div>
               </div>
-            </div>
+            </Link>
             <button
               onClick={handleLogout}
               className="mt-1 flex w-full items-center gap-2 rounded-lg px-3 py-1.5 text-xs text-muted transition-colors hover:bg-red-500/10 hover:text-red-400"
